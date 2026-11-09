@@ -1,13 +1,16 @@
 #![allow(dead_code)]
 
 use core::ffi::{c_void, c_char, c_int};
+use alloc::vec::Vec;
 use axhal::arch::TrapFrame;
 use axhal::trap::{register_trap_handler, SYSCALL};
+use axhal::mem::{MemoryAddr, VirtAddr, PAGE_SIZE_4K};
 use axerrno::LinuxError;
 use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
+use memory_addr::VirtAddrRange;
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -131,7 +134,6 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
@@ -140,7 +142,56 @@ fn sys_mmap(
     fd: i32,
     _offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    let prot = MmapProt::from_bits_truncate(prot);
+    let flags = MmapFlags::from_bits_truncate(flags);
+
+    // The mapping always covers whole pages.
+    let length = (length + PAGE_SIZE_4K - 1) & !(PAGE_SIZE_4K - 1);
+    if length == 0 {
+        return -LinuxError::EINVAL.code() as isize;
+    }
+
+    // For a file-backed mapping, read the file content into a kernel buffer
+    // before taking the address space lock.
+    let mut file_data = Vec::new();
+    if !flags.contains(MmapFlags::MAP_ANONYMOUS) && fd >= 0 {
+        file_data.resize(length, 0);
+        let ret = api::sys_read(fd, file_data.as_mut_ptr() as *mut c_void, length);
+        if ret < 0 {
+            return ret as isize;
+        }
+        file_data.truncate(ret as usize);
+    }
+
+    let curr = current();
+    let mut aspace = curr.task_ext().aspace.lock();
+
+    // Find a free area in the user address space to place the mapping.
+    // Never map the zero page, so that user programs can treat a returned
+    // NULL pointer as an error (like Linux's `mmap_min_addr`).
+    let hint = VirtAddr::from((addr as usize).max(PAGE_SIZE_4K));
+    let uaddr = if flags.contains(MmapFlags::MAP_FIXED) {
+        hint.align_down_4k()
+    } else {
+        match aspace.find_free_area(
+            hint,
+            length,
+            VirtAddrRange::from_start_size(aspace.base(), aspace.size()),
+        ) {
+            Some(uaddr) => uaddr,
+            None => return -LinuxError::ENOMEM.code() as isize,
+        }
+    };
+
+    if aspace.map_alloc(uaddr, length, prot.into(), true).is_err() {
+        return -LinuxError::ENOMEM.code() as isize;
+    }
+    if !file_data.is_empty() {
+        // Copy the file content into the newly created mapping.
+        aspace.write(uaddr, &file_data).unwrap();
+    }
+
+    uaddr.as_usize() as isize
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {

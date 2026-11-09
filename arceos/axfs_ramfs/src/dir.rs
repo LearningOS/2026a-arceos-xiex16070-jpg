@@ -165,7 +165,55 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        log::debug!("rename at ramfs: {} -> {}", src_path, dst_path);
+        let (src_name, src_rest) = split_path(src_path);
+        if let Some(src_rest) = src_rest {
+            // The source path still contains sub directories, resolve them
+            // from this directory first.
+            let subdir = match src_name {
+                "" | "." => return self.rename(src_rest, dst_path),
+                ".." => return self.parent().ok_or(VfsError::NotFound)?.rename(src_rest, dst_path),
+                _ => self
+                    .children
+                    .read()
+                    .get(src_name)
+                    .ok_or(VfsError::NotFound)?
+                    .clone(),
+            };
+            return subdir.rename(src_rest, dst_path);
+        }
+
+        // Only the last component of the destination path is used, so that a
+        // rename never moves a node to another directory (moving is not
+        // supported by the RAM filesystem).
+        let dst_name = split_path_to_end(dst_path);
+        if src_name.is_empty() || src_name == "." || src_name == ".." {
+            return Err(VfsError::InvalidInput);
+        }
+        if dst_name.is_empty() || dst_name == "." || dst_name == ".." {
+            return Err(VfsError::InvalidInput);
+        }
+
+        let mut children = self.children.write();
+        if !children.contains_key(src_name) {
+            return Err(VfsError::NotFound);
+        }
+        if children.contains_key(dst_name) {
+            return Err(VfsError::AlreadyExists);
+        }
+        let node = children.remove(src_name).unwrap();
+        children.insert(dst_name.into(), node);
+        Ok(())
+    }
+
     axfs_vfs::impl_vfs_dir_default! {}
+}
+
+/// Returns the last component (the file name) of the given path.
+fn split_path_to_end(path: &str) -> &str {
+    let trimmed_path = path.trim_end_matches('/');
+    trimmed_path.rsplit('/').next().unwrap_or("")
 }
 
 fn split_path(path: &str) -> (&str, Option<&str>) {

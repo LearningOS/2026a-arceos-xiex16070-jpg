@@ -29,6 +29,16 @@ use crate::regs::GprIndex::{A0, A1};
 
 const VM_ENTRY: usize = 0x8020_0000;
 
+/// Encoding of `csrr a1, mhartid`, which the guest executes to read the hart
+/// id. `mhartid` is a machine-level CSR, so accessing it from VS-mode traps.
+const INSN_CSRR_A1_MHARTID: usize = 0xf140_25f3;
+/// The guest physical address that the guest loads the magic value from.
+const GUEST_MAGIC_ADDR: usize = 0x40;
+/// The hart id emulated for the guest.
+const GUEST_HART_ID: usize = 0x1234;
+/// The magic value read by the guest from [`GUEST_MAGIC_ADDR`].
+const GUEST_MAGIC_VALUE: usize = 0x6688;
+
 #[cfg_attr(feature = "axstd", no_mangle)]
 fn main() {
     ax_println!("Hypervisor ...");
@@ -90,8 +100,8 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
                         let a0 = ctx.guest_regs.gprs.reg(A0);
                         let a1 = ctx.guest_regs.gprs.reg(A1);
                         ax_println!("a0 = {:#x}, a1 = {:#x}", a0, a1);
-                        assert_eq!(a0, 0x6688);
-                        assert_eq!(a1, 0x1234);
+                        assert_eq!(a0, GUEST_MAGIC_VALUE);
+                        assert_eq!(a1, GUEST_HART_ID);
                         ax_println!("Shutdown vm normally!");
                         return true;
                     },
@@ -102,16 +112,34 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
             }
         },
         Trap::Exception(Exception::IllegalInstruction) => {
-            panic!("Bad instruction: {:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
+            // The guest reads `mhartid`, which is not accessible in VS-mode.
+            // Emulate the instruction by returning a hart id and then skip it.
+            let insn = stval::read();
+            if insn == INSN_CSRR_A1_MHARTID {
+                ctx.guest_regs.gprs.set_reg(A1, GUEST_HART_ID);
+                ctx.guest_regs.sepc += 4;
+            } else {
+                panic!(
+                    "Bad instruction: {:#x} sepc: {:#x}",
+                    insn,
+                    ctx.guest_regs.sepc
+                );
+            }
         },
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
-                stval::read(),
-                ctx.guest_regs.sepc
-            );
+            // The guest loads the magic value from a guest physical address
+            // that is not mapped. Emulate the load and then skip it.
+            let fault_addr = stval::read();
+            if fault_addr == GUEST_MAGIC_ADDR {
+                ctx.guest_regs.gprs.set_reg(A0, GUEST_MAGIC_VALUE);
+                ctx.guest_regs.sepc += 4;
+            } else {
+                panic!(
+                    "LoadGuestPageFault: stval {:#x} sepc: {:#x}",
+                    fault_addr,
+                    ctx.guest_regs.sepc
+                );
+            }
         },
         _ => {
             panic!(
